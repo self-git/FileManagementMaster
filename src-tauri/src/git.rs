@@ -243,7 +243,8 @@ impl<'a> Repository<'a> {
         message: &str,
     ) -> Result<String> {
         let scratch = tempfile::tempdir_in(self.control_dir())?;
-        let index = scratch.path().join("index");
+        // Git runs from the repository root and expects a path without Windows' verbatim prefix.
+        let index = scratch.path().strip_prefix(&self.root)?.join("index");
         require_success(
             self.exec(&["read-tree", "--empty"], None, Some(&index))?,
             "read-tree",

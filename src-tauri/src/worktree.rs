@@ -907,6 +907,7 @@ mod tests {
         let lease = WriteLease {
             guard,
             directory: temp.path().to_owned(),
+            recovered: None,
         };
         drop(lease);
         let next = fs::OpenOptions::new()
