@@ -2,14 +2,17 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
-use tauri::{AppHandle, Manager};
+use tauri::{ipc::Channel, AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
+use serde::{Deserialize, Serialize};
 
 use crate::{
+    library::{NovelScanRequest, ScanControl, ScanPhase, ScanPlan, ScanResult, ScanReviewEdit, ScanStop, ScanStopped},
     verify_runtime, CleanupReport, EngineReport, FileHistory, LibraryEngine, LibraryTransition,
     LibraryView, MoveRequest, MoveTransition, ReadRequest, ReadTransition, RestoreRequest,
 };
@@ -197,6 +200,104 @@ pub async fn read_directory(
         engine.read_directory(&directory, &request)
     })
     .await
+}
+
+#[derive(Default)]
+pub(crate) struct NovelScans(Mutex<ScanTasks>);
+
+#[derive(Default)]
+struct ScanTasks {
+    next: u64,
+    active: Option<(u64, Arc<ScanControl>)>,
+    result: Option<(u64, Arc<ScanPlan>)>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum ScanAction {
+    Scan { scope: NovelScanRequest },
+    Review { id: u64, edits: Vec<ScanReviewEdit> },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum ScanEvent {
+    Progress { phase: ScanPhase },
+    Ready { result: ScanResult },
+    Stopped,
+    Failed { message: String },
+}
+
+#[tauri::command]
+pub(crate) fn start_novel_scan(
+    app: AppHandle,
+    action: ScanAction,
+    on_event: Channel<ScanEvent>,
+) -> Result<u64, String> {
+    let runtime = runtime_dir(&app)?;
+    let control = Arc::new(ScanControl::default());
+    let (id, plan) = {
+        let scans = app.state::<NovelScans>();
+        let mut tasks = scans.0.lock().map_err(|_| "无法读取扫描任务")?;
+        if tasks.active.is_some() {
+            return Err("已有扫描任务正在处理".to_owned());
+        }
+        let plan = match &action {
+            ScanAction::Scan { .. } => {
+                tasks.result = None;
+                None
+            }
+            ScanAction::Review { id, .. } => Some(Arc::clone(
+                &tasks.result.as_ref().filter(|(saved, _)| saved == id)
+                    .ok_or("扫描结果已变化，请重新扫描")?.1
+            )),
+        };
+        tasks.next += 1;
+        let id = tasks.next;
+        tasks.active = Some((id, Arc::clone(&control)));
+        (id, plan)
+    };
+    tauri::async_runtime::spawn(async move {
+        let progress_channel = on_event.clone();
+        let worker_control = Arc::clone(&control);
+        let result = tauri::async_runtime::spawn_blocking(move || -> Result<_> {
+            let engine = LibraryEngine::new(&runtime)?;
+            let progress = |phase| {
+                let _ = progress_channel.send(ScanEvent::Progress { phase });
+            };
+            match action {
+                ScanAction::Scan { scope } => engine.scan_novels(&scope, &worker_control, progress),
+                ScanAction::Review { edits, .. } => engine.review_novel_scan(
+                    plan.as_deref().context("扫描结果已变化，请重新扫描")?, &edits,
+                    &worker_control, progress,
+                ),
+            }
+        }).await;
+        let stopped = control.finish();
+        let scans = app.state::<NovelScans>();
+        let mut tasks = scans.0.lock().expect("扫描任务状态");
+        tasks.active = None;
+        let event = match result {
+            Ok(Ok(_)) if stopped => ScanEvent::Stopped,
+            Ok(Ok((result, plan))) => {
+                tasks.result = Some((id, Arc::new(plan)));
+                ScanEvent::Ready { result }
+            }
+            Ok(Err(error)) if error.is::<ScanStopped>() => ScanEvent::Stopped,
+            Ok(Err(error)) => ScanEvent::Failed { message: format!("{error:#}") },
+            Err(error) => ScanEvent::Failed { message: error.to_string() },
+        };
+        drop(tasks);
+        let _ = on_event.send(event);
+    });
+    Ok(id)
+}
+
+#[tauri::command]
+pub(crate) fn stop_novel_scan(scans: State<'_, NovelScans>, id: u64) -> Result<ScanStop, String> {
+    let tasks = scans.0.lock().map_err(|_| "无法读取扫描任务")?;
+    Ok(tasks.active.as_ref().filter(|(task, _)| *task == id)
+        .map_or(ScanStop::Finished, |(_, control)| control.request_stop()))
 }
 
 #[tauri::command]

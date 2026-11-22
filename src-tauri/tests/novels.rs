@@ -4,7 +4,10 @@ use std::{
     process::{Command, Output},
 };
 
-use filemanagement_master::{LibraryEngine, ReadRequest, RestoreRequest};
+use filemanagement_master::{
+    LibraryEngine, NovelFormat, NovelScanRequest, ReadRequest, RestoreRequest,
+    ScanControl, ScanPhase, ScanReviewEdit,
+};
 use serde_json::{json, Value};
 
 fn runtime() -> PathBuf {
@@ -145,6 +148,10 @@ fn scans_nested_files_and_dedupes_only_confirmed_book_and_format() {
     assert!(item(&scanned, unknown)["preferredBook"].is_null());
     assert_eq!(item(&scanned, duplicate)["novel"]["copy"], 1);
     assert_eq!(item(&scanned, old)["supersededBy"], new);
+    assert!(item(&scanned, old)["coveringPaths"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(new)));
 
     let optional = preview(&engine, &root, &source, &json!(["fb2.zip", "pdf"]));
     assert_eq!(optional["items"].as_array().unwrap().len(), 2);
@@ -160,6 +167,8 @@ fn scans_nested_files_and_dedupes_only_confirmed_book_and_format() {
         &scanned,
         &[
             choice(winner, "常看", "keep", &[old, duplicate]),
+            choice(item(&scanned, old), "常看", "history", &[]),
+            choice(item(&scanned, duplicate), "常看", "history", &[]),
             choice(item(&scanned, epub), "常看", "keep", &[]),
             choice(item(&scanned, other), "常看", "keep", &[]),
         ],
@@ -177,6 +186,122 @@ fn scans_nested_files_and_dedupes_only_confirmed_book_and_format() {
     let epub_history =
         serde_json::to_value(engine.file_history(&root, "常看", epub).unwrap()).unwrap();
     assert!(epub_history["versions"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn background_scan_groups_same_txt_names_and_preserves_all_current_files() {
+    let engine = engine();
+    let temp = tempfile::tempdir().unwrap();
+    let root = start_dir(temp.path(), "后台扫描");
+    let copied = if cfg!(windows) { "下载/山海录.txt" } else { "引号\"和反斜线\\与换行\n/山海录.txt" };
+    let editions = ["0911/山海录.txt", "0929/山海录.TXT", copied];
+    let content: [&[u8]; 3] = [b"first\r\n", b"another edition", b"first\r\n"];
+    for (path, bytes) in editions.iter().zip(content) {
+        put(&root, path, bytes);
+    }
+    put(&root, "0911/连载2 1-100 作者：舟.txt", b"early");
+    put(&root, "0929/[已完结] 连载2 1-130 作者：舟.txt", b"full");
+    put(&root, "0929/连载2 1-130 作者：江.txt", b"other");
+    put(&root, "0911/连载2 作者：舟.epub", b"epub");
+    put(&root, "附件.bin", b"unchecked");
+    let adopted = engine.adopt_or_open(&root).unwrap().library;
+    let head = git(&root, &["rev-parse", "HEAD"]).stdout;
+    let mut scope = NovelScanRequest {
+        directory: root.clone(),
+        branch: adopted.current_branch.clone(),
+        revision: adopted.revision,
+        formats: [NovelFormat::Txt, NovelFormat::Epub].into(),
+    };
+    let verified_while_open = std::cell::Cell::new(false);
+    let (result, _) = engine.scan_novels(&scope, &ScanControl::default(), |phase| {
+        if matches!(phase, ScanPhase::Verifying { .. }) {
+            assert!(engine.path_for_open(&root, &scope.branch, editions[0]).is_ok());
+            verified_while_open.set(true);
+        }
+    }).unwrap();
+    assert!(verified_while_open.get());
+    assert_eq!(result.matched, 7);
+    assert_eq!(result.library.books.len(), 3);
+    let book = result.library.books.iter().find(|book| book.title == "山海录").unwrap();
+    assert_eq!(book.files.len(), 3);
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]).stdout, head);
+    for (path, bytes) in editions.iter().zip(content) {
+        assert_eq!(fs::read(root.join(path)).unwrap(), bytes);
+    }
+    let report = serde_json::to_value(&result.groups).unwrap();
+    assert!(report.as_array().unwrap().iter().flat_map(|group| group["files"].as_array().unwrap())
+        .any(|file| file["path"] == editions[2] && file["sameAs"] == editions[0]));
+    assert!(report.as_array().unwrap().iter().flat_map(|group| group["files"].as_array().unwrap())
+        .any(|file| file["path"] == "0911/连载2 1-100 作者：舟.txt"
+            && file["supersededBy"] == "0929/[已完结] 连载2 1-130 作者：舟.txt"));
+
+    scope.revision = result.library.revision;
+    let (again, _) = engine.scan_novels(&scope, &ScanControl::default(), |_| {}).unwrap();
+    assert_eq!(again.library.revision, scope.revision);
+    scope.formats = [NovelFormat::Pdf].into();
+    let (empty, _) = engine.scan_novels(&scope, &ScanControl::default(), |phase| {
+        assert!(!matches!(phase, ScanPhase::Verifying { .. } | ScanPhase::Publishing));
+    }).unwrap();
+    assert_eq!(empty.matched, 0);
+    assert_eq!(empty.library.revision, scope.revision);
+}
+
+#[test]
+fn stopped_scan_and_stale_review_preserve_files_and_git_references() {
+    let engine = engine();
+    let temp = tempfile::tempdir().unwrap();
+    let root = start_dir(temp.path(), "停止扫描");
+    let first = "早期/旧书.txt";
+    let second = "新版/旧书.txt";
+    put(&root, first, b"early");
+    put(&root, second, b"later");
+    let adopted = engine.adopt_or_open(&root).unwrap().library;
+    let before = git(&root, &["for-each-ref"]).stdout;
+    let scope = NovelScanRequest {
+        directory: root.clone(),
+        branch: adopted.current_branch.clone(),
+        revision: adopted.revision,
+        formats: [NovelFormat::Txt].into(),
+    };
+    let control = ScanControl::default();
+    let stopped = engine.scan_novels(&scope, &control, |phase| {
+        if matches!(phase, ScanPhase::Verifying { .. }) {
+            assert!(control.cancel());
+        }
+    }).err().expect("扫描应停止");
+    assert_eq!(stopped.to_string(), "扫描已停止");
+    assert_eq!(git(&root, &["for-each-ref"]).stdout, before);
+    assert_eq!(fs::read(root.join(first)).unwrap(), b"early");
+    assert_eq!(fs::read(root.join(second)).unwrap(), b"later");
+    assert!(!root.join(".git/filemanagement/pending.json").exists());
+
+    let (result, plan) = engine.scan_novels(&scope, &ScanControl::default(), |_| {}).unwrap();
+    assert_eq!(result.library.books.len(), 1);
+    let changes = [ScanReviewEdit::Archive { group: 0, paths: [first.to_owned()].into() }];
+    let grouped = git(&root, &["for-each-ref"]).stdout;
+    put(&root, first, b"edited");
+    let stale = engine.review_novel_scan(&plan, &changes, &ScanControl::default(), |_| {});
+    assert!(stale.is_err());
+    assert_eq!(fs::read(root.join(first)).unwrap(), b"edited");
+    assert_eq!(git(&root, &["for-each-ref"]).stdout, grouped);
+    put(&root, first, b"early");
+    let cancel = ScanControl::default();
+    let stopped_review = engine.review_novel_scan(&plan, &changes, &cancel, |phase| {
+        if matches!(phase, ScanPhase::Verifying { .. }) {
+            assert!(cancel.cancel());
+        }
+    });
+    assert!(stopped_review.is_err());
+    assert_eq!(git(&root, &["for-each-ref"]).stdout, grouped);
+
+    let (reviewed, current_plan) = engine.review_novel_scan(&plan, &changes, &ScanControl::default(), |_| {}).unwrap();
+    assert_eq!(reviewed.library.books[0].files, [second]);
+    assert!(!root.join(first).exists());
+    let history = serde_json::to_value(engine.file_history(&root, &scope.branch, second).unwrap()).unwrap();
+    assert_eq!(history["versions"][0]["savedPath"], first);
+    engine.create_branch(&root, "另一分支").unwrap();
+    engine.switch(&root, "另一分支", None).unwrap();
+    assert!(engine.review_novel_scan(&current_plan, &changes, &ScanControl::default(), |_| {}).is_err());
 }
 
 #[test]

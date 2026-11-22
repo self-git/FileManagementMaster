@@ -367,6 +367,14 @@ fn reopening_rolls_back_staging_and_finishes_published_move() {
         let reopened = engine.open_default(root).unwrap();
         assert_eq!(reopened.library.current_branch, SOURCE);
         assert!(reopened.pending.is_none());
+        assert_eq!(
+            reopened.recovery,
+            Some(if boundary == "published" {
+                RefState::AfterCommit
+            } else {
+                RefState::BeforeCommit
+            })
+        );
         assert_clean(root);
         assert_eq!(references(&repo), interrupted);
         assert_eq!(

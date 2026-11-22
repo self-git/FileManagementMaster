@@ -2,10 +2,10 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -205,6 +205,72 @@ impl<'a> Repository<'a> {
         let file = fs::File::open(path).with_context(|| format!("打开文件 {}", path.display()))?;
         let output = self.git.command(&self.root, args).stdin(file).output()?;
         stdout_text(output, "hash-object")
+    }
+
+    pub(crate) fn file_oids(
+        &self,
+        paths: &[&str],
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut input = tempfile::tempfile()?;
+        let mut names = Vec::new();
+        for path in paths {
+            checkpoint()?;
+            // Git 的 stdin-paths 接受 C 风格引用，文件名可包含换行和引号。
+            names.push(b'"');
+            for byte in path.bytes() {
+                match byte {
+                    b'\\' | b'"' => names.extend([b'\\', byte]),
+                    0..=31 | 127 => write!(names, "\\{byte:03o}")?,
+                    _ => names.push(byte),
+                }
+            }
+            names.extend(b"\"\n");
+        }
+        input.write_all(&names)?;
+        input.rewind()?;
+        checkpoint()?;
+
+        let mut output = tempfile::tempfile()?;
+        let mut errors = tempfile::tempfile()?;
+        let mut child = self
+            .git
+            .command(&self.root, &["hash-object", "--no-filters", "--stdin-paths"])
+            .stdin(input)
+            .stdout(output.try_clone()?)
+            .stderr(errors.try_clone()?)
+            .spawn()?;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    child.wait()?;
+                    return Err(error.into());
+                }
+            }
+            if let Err(stopped) = checkpoint() {
+                let _ = child.kill();
+                child.wait()?;
+                return Err(stopped);
+            }
+            std::thread::sleep(Duration::from_millis(12));
+        };
+        checkpoint()?;
+        if !status.success() {
+            errors.rewind()?;
+            let mut message = String::new();
+            errors.read_to_string(&mut message)?;
+            bail!("Git 批量计算文件指纹失败 {}", message.trim());
+        }
+        output.rewind()?;
+        let oids = BufReader::new(output).lines().collect::<std::io::Result<Vec<_>>>()?;
+        ensure!(oids.len() == paths.len(), "Git 返回的文件指纹数量不匹配");
+        Ok(oids)
     }
 
     pub(crate) fn extract_blob(&self, oid: &str, file: &fs::File) -> Result<()> {

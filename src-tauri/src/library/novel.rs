@@ -96,6 +96,12 @@ static CHAPTER: LazyLock<Regex> =
 static NOTE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)未完[结結本]?|已完[结結本]?|连载中|連載中|完[结結本]|全本|全集|排版|修[改订訂正]|重修|加料|无删减|無刪減|合订|合訂|番外|续更|續更|单卷|單卷|补档|補檔").unwrap()
 });
+static LEADING_NOTE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:\[([^\]]+)\]|【([^】]+)】)\s*").unwrap()
+});
+static VERSION_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:(?:已?完[结結本]|未完[结結本]?|[连連][载載]中|全本|全集|番外|补档|補檔|排版|修[订訂]|第?[一二三四五六七八九十两0-9]+卷)|[0-9+\-–~章卷篇集节、，\s])+$").unwrap()
+});
 
 impl NovelName {
     pub(super) fn parse(path: &str) -> Option<Self> {
@@ -110,9 +116,10 @@ impl NovelName {
             .as_ref()
             .and_then(|capture| capture.get(0))
             .map_or(stem, |suffix| &stem[..suffix.start()]);
+        let (stem, leading_note) = split_leading_notes(stem);
         let (before, author, after) = split_author(stem);
         let (title, note) = split_title(before);
-        let notes = format!("{note} {after}");
+        let notes = format!("{leading_note} {note} {after}");
         let completed = ["完结", "完結", "完本", "全本", "全集"]
             .iter()
             .any(|marker| notes.contains(marker))
@@ -182,6 +189,26 @@ impl NovelName {
     pub(super) fn copy_rank(&self) -> (bool, u32) {
         (self.copy.is_some(), self.copy.unwrap_or(0))
     }
+
+    pub(super) fn coverage_rank(&self) -> Option<(bool, u32, u32, bool)> {
+        if self.revised || self.supplemental {
+            return None;
+        }
+        match self.coverage? {
+            Coverage::Chapters(start, end) => Some((false, u32::MAX - start, end, self.completed)),
+            Coverage::Volumes(volume, chapter) => Some((true, volume, chapter, self.completed)),
+        }
+    }
+}
+
+pub(super) fn normalized_leaf(path: &str) -> String {
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    ComposingNormalizer::new_nfkc()
+        .normalize(leaf)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 pub(super) fn identity(text: &str) -> String {
@@ -200,11 +227,26 @@ pub(super) fn possibly_same(a: &str, b: &str) -> bool {
     a == b || aliases(&a).any(|alias| alias == b) || aliases(&b).any(|alias| alias == a)
 }
 
-fn aliases(value: &str) -> impl Iterator<Item = &str> {
+pub(super) fn aliases(value: &str) -> impl Iterator<Item = &str> {
     value
         .split("又名")
         .flat_map(|part| part.split(['(', ')', '[', ']', '/', '、']))
         .filter(|part| !part.is_empty())
+}
+
+fn split_leading_notes(mut stem: &str) -> (&str, String) {
+    let mut notes = String::new();
+    while let Some(mark) = LEADING_NOTE.captures(stem) {
+        let body = mark.get(1).or_else(|| mark.get(2)).unwrap().as_str().trim();
+        let rest = &stem[mark.get(0).unwrap().end()..];
+        if rest.is_empty() || !VERSION_LABEL.is_match(body) || !NOTE.is_match(body) && !VOLUME.is_match(body) {
+            break;
+        }
+        notes.push_str(body);
+        notes.push(' ');
+        stem = rest;
+    }
+    (stem, notes)
 }
 
 fn clean(text: &str) -> &str {

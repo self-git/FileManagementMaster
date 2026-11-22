@@ -30,8 +30,63 @@ export interface Library {
   files: string[]
   books: Book[]
   novels: Partial<Record<string, NovelName>>
+  fileDetails: Partial<Record<string, { bytes: number; modifiedAt: number | null }>>
   revision: number
 }
+
+export interface NovelScanScope {
+  directory: string
+  branch: string
+  revision: number
+  formats: NovelFormat[]
+}
+
+export type ScanPhase =
+  | { kind: 'discovering'; found: number }
+  | { kind: 'identifying'; processed: number; total: number }
+  | { kind: 'verifying'; total: number }
+  | { kind: 'publishing' }
+
+export type ScanReview = 'unsaved' | 'authorUnclear' | 'authorConflict' | 'bookConflict' | 'historyLimit'
+
+export interface ScannedFile {
+  path: string
+  novel: NovelName
+  saved: boolean
+  sameAs: string | null
+  supersededBy: string | null
+}
+
+export interface ScannedBook {
+  id: number
+  title: string
+  author: string | null
+  bookId: number | null
+  files: ScannedFile[]
+  review: ScanReview | null
+}
+
+export interface ScanResult {
+  library: Library
+  groups: ScannedBook[]
+  matched: number
+}
+
+export type ScanReviewEdit =
+  | { kind: 'merge'; group: number }
+  | { kind: 'archive'; group: number; paths: string[] }
+
+export type ScanAction =
+  | { kind: 'scan'; scope: NovelScanScope }
+  | { kind: 'review'; id: number; edits: ScanReviewEdit[] }
+
+export type ScanEvent =
+  | { kind: 'progress'; phase: ScanPhase }
+  | { kind: 'ready'; result: ScanResult }
+  | { kind: 'stopped' }
+  | { kind: 'failed'; message: string }
+
+export type ScanStop = 'requested' | 'publishing' | 'finished'
 
 export type BrowserSelection =
   | { kind: 'files'; paths: string[] }
@@ -48,6 +103,12 @@ export function fileSuffix(path: string) {
   if (suffix.endsWith('.fb2.zip')) return 'fb2.zip'
   const dot = suffix.lastIndexOf('.')
   return dot > 0 ? suffix.slice(dot + 1) : ''
+}
+
+export function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  const unit = bytes >= 1024 ** 3 ? 3 : bytes >= 1024 ** 2 ? 2 : 1
+  return `${(bytes / 1024 ** unit).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} ${['', 'KiB', 'MiB', 'GiB'][unit]}`
 }
 
 type ChangeKind = 'added' | 'modified' | 'removed' | 'renamed'

@@ -8,12 +8,14 @@ pub use git::run_gc_worker;
 pub use library::{
     BookView, ChangeKind, CleanupReport, FileHistory, LibraryEngine, LibraryTransition,
     LibraryView, MoveConfirmation, MoveItem, MoveRequest, MoveSelection, MoveStatus,
-    MoveTransition, NovelFormat, ReadRequest, ReadTransition, RestoreRequest, SwitchPreview,
+    MoveTransition, NovelFormat, NovelScanRequest, ReadRequest, ReadTransition, RestoreRequest,
+    ScanControl, ScanPhase, ScanPlan, ScanResult, ScanReviewEdit, SwitchPreview,
 };
 pub use verification::{verify_runtime, EngineReport};
 
 pub fn run() {
     let builder = tauri::Builder::default()
+        .manage(commands::NovelScans::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init());
     #[cfg(target_os = "macos")]
@@ -48,6 +50,8 @@ pub fn run() {
             commands::create_book,
             commands::move_files,
             commands::read_directory,
+            commands::start_novel_scan,
+            commands::stop_novel_scan,
             commands::file_history,
             commands::restore_version,
             commands::collect_garbage,

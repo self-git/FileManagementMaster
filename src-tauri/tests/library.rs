@@ -10,6 +10,48 @@ fn engine() -> LibraryEngine {
 }
 
 #[test]
+fn desktop_view_opens_only_paths_in_the_current_managed_branch() {
+    let engine = engine();
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("管理 目录");
+    let folder = root.join("01 文稿");
+    let relative = "01 文稿/《远航》 1-24 作者：舟.TXT";
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(root.join(relative), b"one").unwrap();
+    let adopted = engine.adopt_or_open(&root).unwrap();
+    let view = serde_json::to_value(&adopted.library).unwrap();
+    assert_eq!(view["fileDetails"][relative]["bytes"], 3);
+    assert!(view["fileDetails"][relative]["modifiedAt"].is_u64());
+    assert_eq!(view["novels"][relative]["format"], "txt");
+    assert_eq!(view["novels"][relative]["author"], "舟");
+    assert!(view["novels"][relative]["progress"].is_string());
+    assert_eq!(
+        engine.path_for_open(&root, "常看", relative).unwrap(),
+        root.join(relative).canonicalize().unwrap()
+    );
+    assert_eq!(
+        engine.path_for_open(&root, "常看", "01 文稿").unwrap(),
+        folder.canonicalize().unwrap()
+    );
+    assert!(engine.path_for_open(&root, "常看", ".git").is_err());
+    assert!(engine.path_for_open(&root, "常看", "../同级目录").is_err());
+
+    engine.create_branch(&root, "资料").unwrap();
+    engine.switch(&root, "资料", None).unwrap();
+    assert!(engine.path_for_open(&root, "常看", relative).is_err());
+    engine.switch(&root, "常看", None).unwrap();
+
+    #[cfg(unix)]
+    {
+        let outside = sandbox.path().join("其他文件.txt");
+        fs::write(&outside, b"outside").unwrap();
+        fs::remove_file(root.join(relative)).unwrap();
+        std::os::unix::fs::symlink(outside, root.join(relative)).unwrap();
+        assert!(engine.path_for_open(&root, "常看", relative).is_err());
+    }
+}
+
+#[test]
 fn adoption_saves_external_changes_and_reopens_default_branch() {
     let engine = engine();
     let sandbox = tempfile::tempdir().unwrap();

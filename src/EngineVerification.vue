@@ -41,53 +41,25 @@ async function runVerification() {
 </script>
 
 <template>
-  <main class="workspace">
-    <header class="topbar">
-      <span class="product">FileManagementMaster</span>
-      <span
-        class="status"
-        :data-status="verification.status"
-        role="status"
-      >{{ { idle: '待验证', running: '验证中', passed: '已通过', failed: '验证失败' }[verification.status] }}</span>
-    </header>
-
-    <section class="introduction" aria-labelledby="title">
-      <div>
-        <h1 id="title">Git 引擎验证</h1>
-        <p>在临时书库中检查随包 Git、分支引用和实际对象回收。</p>
-      </div>
-      <button type="button" :disabled="verification.status === 'running'" @click="runVerification">
-        {{ verification.status === 'running' ? '正在验证' : '运行验证' }}
+  <section class="diagnostics" aria-label="Git 引擎验证">
+    <div class="diagnostic-intro">
+      <p>验证随包 Git、引用事务、中断恢复和实际对象回收。</p>
+      <button class="button" type="button" data-initial-focus :disabled="verification.status === 'running'" @click="runVerification">
+        {{ verification.status === 'running' ? '正在验证…' : '运行验证' }}
       </button>
-    </section>
-
-    <section v-if="verification.status === 'passed'" class="results" aria-labelledby="results-title">
-      <div class="result-heading">
+    </div>
+    <template v-if="verification.status === 'passed'">
+      <p role="status">{{ verification.report.gitVersion }} · {{ verification.report.refFormat }} · 已通过</p>
+      <dl>
+        <div v-for="check in verification.report.checks" :key="check.name">
+          <dt>{{ check.name }}</dt><dd>{{ check.detail }}</dd>
+        </div>
         <div>
-          <h2 id="results-title">验证结果</h2>
-          <p class="technical">{{ verification.report.gitVersion }} · {{ verification.report.refFormat }}</p>
+          <dt>对象库缩减</dt><dd>{{ formatBytes.format(verification.report.objectBytesBefore - verification.report.objectBytesAfter) }}</dd>
         </div>
-        <div class="reclaimed">
-          <span>对象库缩减</span>
-          <strong>{{ formatBytes.format(verification.report.objectBytesBefore - verification.report.objectBytesAfter) }}</strong>
-        </div>
-      </div>
-      <dl class="checks">
-        <div v-for="check in verification.report.checks" :key="check.name" class="check">
-          <dt>{{ check.name }}</dt>
-          <dd>{{ check.detail }}</dd>
-        </div>
+        <div><dt>随包程序</dt><dd><code>{{ verification.report.binaryPath }}</code></dd></div>
       </dl>
-      <p class="binary"><span>随包程序</span><code>{{ verification.report.binaryPath }}</code></p>
-    </section>
-
-    <section v-else-if="verification.status === 'failed'" class="results error" role="alert">
-      <h2>验证失败</h2>
-      <p>{{ verification.error }}</p>
-    </section>
-    <section v-else class="results empty">
-      <h2>{{ verification.status === 'running' ? '正在检查临时书库' : '验证项目' }}</h2>
-      <p>随包运行时 · 引用事务 · 中断后的索引恢复 · 过期对象回收</p>
-    </section>
-  </main>
+    </template>
+    <p v-else-if="verification.status === 'failed'" class="inline-error" role="alert">{{ verification.error }}</p>
+  </section>
 </template>

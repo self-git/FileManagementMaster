@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use anyhow::{ensure, Context, Result};
@@ -16,6 +17,7 @@ mod history;
 mod movement;
 mod novel;
 mod reading;
+mod scan;
 
 pub use history::{CleanupReport, FileHistory, RestoreRequest};
 pub use movement::{
@@ -24,6 +26,8 @@ pub use movement::{
 pub use novel::NovelFormat;
 use novel::NovelName;
 pub use reading::{ReadRequest, ReadTransition};
+pub use scan::{NovelScanRequest, ScanControl, ScanPhase, ScanPlan, ScanReviewEdit, ScanResult};
+pub(crate) use scan::{ScanStop, ScanStopped};
 
 const STATE_REF: &str = "refs/filemanagement/state";
 const INITIAL_BRANCH: &str = "常看";
@@ -43,7 +47,15 @@ pub struct LibraryView {
     pub files: Vec<String>,
     pub books: Vec<BookView>,
     novels: BTreeMap<String, NovelName>,
+    file_details: BTreeMap<String, FileDetails>,
     pub revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileDetails {
+    bytes: u64,
+    modified_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,6 +310,22 @@ impl State {
                 .keys()
                 .filter_map(|path| NovelName::parse(path).map(|name| (path.clone(), name)))
                 .collect(),
+            // 文件清单来自 HEAD，大小和修改时间取自当前工作目录中的对应常规文件。
+            file_details: entries
+                .keys()
+                .filter_map(|path| {
+                    let resolved = worktree::resolved_path(repo.root(), path, false).ok()?;
+                    let info = fs::symlink_metadata(resolved).ok()?;
+                    (info.is_file() && !worktree::is_link(&info)).then(|| {
+                        (path.clone(), FileDetails {
+                            bytes: info.len(),
+                            modified_at: info.modified().ok()
+                                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                                .map(|duration| duration.as_millis() as u64),
+                        })
+                    })
+                })
+                .collect(),
             revision: self.catalog.revision,
         })
     }
@@ -475,8 +503,7 @@ impl LibraryEngine {
         let is_file = entries.contains_key(path);
         let prefix = format!("{path}/");
         ensure!(
-            is_file || entries.range(prefix.clone()..).next()
-                .is_some_and(|(entry, _)| entry.starts_with(&prefix)),
+            is_file || entries.range(prefix.clone()..).next().is_some_and(|(entry, _)| entry.starts_with(&prefix)),
             "路径不在当前分支 {path}"
         );
         let resolved = worktree::resolved_path(repo.root(), path, false)?;
@@ -538,9 +565,20 @@ fn snapshot_branch(
 fn publish_branches(
     repo: &Repository<'_>,
     lease: &WriteLease,
+    state: State,
+    updated: BTreeMap<String, Branch>,
+    message: &str,
+) -> Result<LibraryView> {
+    publish_branches_checked(repo, lease, state, updated, message, None)
+}
+
+fn publish_branches_checked(
+    repo: &Repository<'_>,
+    lease: &WriteLease,
     mut state: State,
     updated: BTreeMap<String, Branch>,
     message: &str,
+    checks: Option<worktree::OperationChecks<'_>>,
 ) -> Result<LibraryView> {
     let previous_head = state.catalog.branch(&state.head)?.clone();
     let mut edits = Vec::new();
@@ -579,7 +617,7 @@ fn publish_branches(
     };
     let next = state.catalog.snapshot(repo, message)?;
     edits.push(RefEdit::replace(STATE_REF, &state.oid, &next));
-    worktree::apply_operation(repo, lease, edits, plan, stage)?;
+    worktree::apply_operation_checked(repo, lease, edits, plan, stage, checks)?;
     State::load(repo)?.view(repo)
 }
 

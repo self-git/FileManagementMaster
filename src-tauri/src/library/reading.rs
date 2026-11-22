@@ -82,6 +82,7 @@ struct ReadItem {
     books: Vec<ReadBook>,
     preferred_book: Option<String>,
     superseded_by: Option<String>,
+    covering_paths: Vec<String>,
     same_paths: Vec<ReadLocation>,
 }
 
@@ -402,6 +403,7 @@ fn novel_preview(
             books,
             preferred_book,
             superseded_by: None,
+            covering_paths: Vec::new(),
             same_paths: Vec::new(),
         });
     }
@@ -410,7 +412,7 @@ fn novel_preview(
             continue;
         };
         let (_, file, name, _, _) = &rows[i];
-        let other = (0..items.len())
+        let covering: Vec<_> = (0..items.len())
             .filter(|&j| j != i && items[j].preferred_book.as_ref() == Some(book))
             .filter(|&j| {
                 let (_, other_file, other_name, _, _) = &rows[j];
@@ -420,6 +422,8 @@ fn novel_preview(
                             && !name.covers(other_name)
                             && (other_name.copy_rank(), j) < (name.copy_rank(), i)))
             })
+            .collect();
+        let other = covering.iter().copied()
             .reduce(|a, b| {
                 let first = &rows[a].2;
                 let second = &rows[b].2;
@@ -432,6 +436,7 @@ fn novel_preview(
                 }
             });
         items[i].superseded_by = other.map(|j| items[j].path.clone());
+        items[i].covering_paths = covering.into_iter().map(|j| items[j].path.clone()).collect();
     }
     (items, groups)
 }
@@ -445,6 +450,7 @@ fn ordinary_preview(state: &State, inputs: &Files) -> Vec<ReadItem> {
             books: Vec::new(),
             preferred_book: None,
             superseded_by: None,
+            covering_paths: Vec::new(),
             same_paths: state
                 .catalog
                 .branches
@@ -562,7 +568,7 @@ fn apply_read(
         if selection.action == ReadAction::History {
             ensure!(selection.replaces.is_empty(), "归入旧版时无需替换当前文件");
             if read.local {
-                ensure!(removals.insert((branch, path)), "文件重复设置为旧版 {path}");
+                removals.insert((branch, path));
             }
         } else {
             validate_destination(repo, path, destination)?;
@@ -578,10 +584,8 @@ fn apply_read(
                         && (book.is_some() || replaced == destination),
                     "替换目标不属于所选书目和格式 {replaced}"
                 );
-                ensure!(
-                    removals.insert((branch, replaced)),
-                    "文件重复设置为旧版 {replaced}"
-                );
+                // 全选时新版替换和旧版归档可以指向同一原件，实际只移出一次。
+                removals.insert((branch, replaced));
             }
         }
         chosen.push((selection, book, format, destination));

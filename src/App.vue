@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import DesktopIcon from './DesktopIcon.vue'
@@ -7,7 +7,13 @@ import DesktopSheet from './DesktopSheet.vue'
 import EngineVerification from './EngineVerification.vue'
 import LibraryBrowser from './LibraryBrowser.vue'
 import LibraryReading from './LibraryReading.vue'
-import { changeLabels, fileName, fileSuffix, type Book, type BrowserSelection, type ExternalChange, type Library, type WorkspaceModule } from './library-types'
+import LibraryScan from './LibraryScan.vue'
+import {
+  changeLabels, defaultFormats, fileName, fileSuffix, formatBytes,
+  type Book, type BrowserSelection, type ExternalChange, type Library, type NovelFormat,
+  type NovelScanScope, type ScanAction, type ScanEvent, type ScanPhase, type ScanResult,
+  type ScanReviewEdit, type ScanStop, type WorkspaceModule,
+} from './library-types'
 import './library.css'
 
 interface SwitchPreview {
@@ -61,8 +67,17 @@ interface CleanupReport {
   afterBytes: number
 }
 
-type Panel = 'chooser' | 'branch' | 'switch' | 'move' | 'reading' | 'history' | 'storage' | 'diagnostics' | 'book'
+type Panel = 'chooser' | 'branch' | 'switch' | 'move' | 'reading' | 'history' | 'storage' | 'diagnostics' | 'book' | 'scanSetup' | 'scanResults'
 type Visibility = 'auto' | 'shown' | 'hidden'
+type ScanTerminal = Exclude<ScanEvent, { kind: 'progress' }>
+type ScanState = ScanPhase | Exclude<ScanTerminal, { kind: 'ready' }> | { kind: 'starting' | 'stopping' | 'ready' | 'stale' }
+type ScanContext = Omit<NovelScanScope, 'formats'>
+
+interface ActiveScan {
+  start: Promise<number | null>
+  settled: Promise<void>
+  stopBeforeStart: AbortController
+}
 
 const modules = { files: '文件管理', books: '书库管理' } satisfies Record<WorkspaceModule, string>
 const moduleKey = 'filemanagement.active-module'
@@ -98,7 +113,44 @@ const createMode = ref(false)
 const directoryName = ref('')
 const branchName = ref('')
 const bookTitle = ref('')
-const readingEntry = ref<'scan' | 'import' | 'save'>('scan')
+const readingEntry = ref<'import' | 'save'>('import')
+
+// 任务与预览都由应用持有，关闭设置或切换模块时后台仍可继续。
+const scanFormats = ref<NovelFormat[]>([...defaultFormats])
+const scanState = shallowRef<ScanState | null>(null)
+const scanResult = shallowRef<{ id: number; data: ScanResult } | null>(null)
+const scanBranch = ref('')
+const scanDetails = ref(false)
+const scanTrigger = ref<HTMLButtonElement | null>(null)
+let activeScan: ActiveScan | null = null
+const scanRunning = computed(() => {
+  const kind = scanState.value?.kind
+  return kind === 'starting' || kind === 'discovering' || kind === 'identifying'
+    || kind === 'verifying' || kind === 'publishing' || kind === 'stopping'
+})
+const scanCanStop = computed(() => scanRunning.value
+  && scanState.value?.kind !== 'publishing' && scanState.value?.kind !== 'stopping')
+const scanStatus = computed(() => {
+  const current = scanState.value
+  switch (current?.kind) {
+    case 'starting': return '准备任务…'
+    case 'discovering': return current.found ? `正在查找 · 已找到 ${current.found} 个文件` : '正在查找文件…'
+    case 'identifying': return `已识别 ${current.processed} / ${current.total}`
+    case 'verifying': return `正在校验 ${current.total} 个文件…`
+    case 'publishing': return '正在提交书目…'
+    case 'stopping': return '正在停止…'
+    case 'stopped': return '扫描已停止'
+    case 'failed': return '扫描任务未完成'
+    case 'stale': return '扫描结果已失效'
+    case 'ready': {
+      const groups = scanResult.value?.data.groups
+      if (!groups?.length) return '扫描完成 · 无匹配文件'
+      const review = groups.filter(group => group.review).length
+      return `已归组 ${groups.length - review} 本${review ? ` · ${review} 组待确认` : ''}`
+    }
+    default: return ''
+  }
+})
 
 // 确认时回传最初的操作意图和 Rust 预览票据。
 const pending = shallowRef<SwitchPreview | null>(null)
@@ -127,6 +179,7 @@ const pathLabel = computed(() => {
   return path.startsWith('\\\\?\\') ? path.slice(4) : path
 })
 const libraryName = computed(() => pathLabel.value.split(/[\\/]/).filter(Boolean).at(-1) ?? '文件管理大师')
+const viewFolder = computed(() => activeModule.value === 'files' ? folder.value : '')
 const crumbs = computed(() => folder.value ? folder.value.split('/').map((name, i, parts) => ({
   name, path: parts.slice(0, i + 1).join('/'),
 })) : [])
@@ -134,8 +187,14 @@ const pickedBook = computed(() => {
   const picked = selection.value
   return picked?.kind === 'book' ? library.value?.books.find(book => book.id === picked.id) : undefined
 })
-const selectedFiles = computed(() => selection.value?.kind === 'files' ? selection.value.paths : [])
-const singleFile = computed(() => selectedFiles.value.length === 1 ? selectedFiles.value[0] : undefined)
+const selectedFiles = computed(() => {
+  const picked = selection.value
+  if (picked?.kind === 'files') return picked.paths
+  if (picked?.kind === 'folder') return library.value?.files.filter(path => path.startsWith(`${picked.path}/`)) ?? []
+  return []
+})
+const singleFile = computed(() => selection.value?.kind === 'files' && selectedFiles.value.length === 1 ? selectedFiles.value[0] : undefined)
+const selectedFileDetails = computed(() => singleFile.value ? library.value?.fileDetails[singleFile.value] : undefined)
 const selectedFolder = computed(() => selection.value?.kind === 'folder' ? selection.value.path : undefined)
 const pickedPath = computed(() => singleFile.value ?? selectedFolder.value)
 const canMove = computed(() => !!(pickedBook.value || selectedFiles.value.length) && otherBranches.value.length > 0)
@@ -153,7 +212,7 @@ const visibleFileCount = computed(() => {
   return library.value?.files.filter(path => path.startsWith(prefix)).length ?? 0
 })
 const bookCount = computed(() => library.value?.books.length ?? 0)
-const selectedCount = computed(() => pickedBook.value?.files.length ?? (selectedFolder.value ? 1 : selectedFiles.value.length))
+const selectedCount = computed(() => pickedBook.value?.files.length ?? selectedFiles.value.length)
 const historyTabs = computed(() => {
   const active = history.value
   if (!active?.book) return []
@@ -167,14 +226,21 @@ const historyTabs = computed(() => {
   }
   return [...formats.values()]
 })
+const historyPeers = computed(() => {
+  const active = history.value
+  if (!active?.book) return []
+  const format = library.value?.novels[active.path]?.format
+  return format ? active.book.files.filter(path => library.value?.novels[path]?.format === format) : []
+})
 const title = computed(() => {
   switch (panel.value) {
     case 'chooser': return '打开管理目录'
     case 'branch': return '新建分支'
     case 'switch': return '先保存外部改动'
     case 'move': return movePending.value?.status.kind === 'saveExternal' ? '先保存外部改动' : '移至分支'
-    case 'reading': return readingEntry.value === 'save' ? '保存外部改动'
-      : readingEntry.value === 'scan' ? '扫描小说' : activeModule.value === 'books' ? '导入更新' : '读取来源目录'
+    case 'reading': return readingEntry.value === 'save' ? '保存外部改动' : activeModule.value === 'books' ? '导入更新' : '读取来源目录'
+    case 'scanSetup': return '扫描小说'
+    case 'scanResults': return '扫描结果'
     case 'history': return restoreChoice.value ? '恢复旧版' : '版本历史'
     case 'book': return '创建书目'
     case 'storage': return '空间管理'
@@ -213,26 +279,21 @@ watch([() => library.value?.directory, () => library.value?.revision], () => {
   queueCleanup()
 })
 watch(panel, queueCleanup)
+watch(scanRunning, queueCleanup)
 
 function queueCleanup() {
   window.clearTimeout(cleanupTimer)
-  if (!cleanupQueued || busy.value || panel.value || cleanupInFlight || !library.value) return
+  if (!cleanupQueued || busy.value || scanRunning.value || panel.value || cleanupInFlight || !library.value) return
   // 合并短时间内的保存。界面写操作等当前回收进程结束再执行。
   cleanupTimer = window.setTimeout(() => {
     const directory = library.value?.directory
-    if (!directory || busy.value || panel.value || cleanupInFlight) return
+    if (!directory || busy.value || scanRunning.value || panel.value || cleanupInFlight) return
     cleanupQueued = false
     cleanupInFlight = collect(directory, false).finally(() => {
       cleanupInFlight = null
       queueCleanup()
     })
   }, 1600)
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`
-  const unit = bytes >= 1024 ** 3 ? 3 : bytes >= 1024 ** 2 ? 2 : 1
-  return `${(bytes / 1024 ** unit).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} ${['', 'KiB', 'MiB', 'GiB'][unit]}`
 }
 
 async function collect(directory: string, manual: boolean) {
@@ -245,7 +306,7 @@ async function collect(directory: string, manual: boolean) {
       cleanupNotice.value = released > 0
         ? `对象库已释放 ${formatBytes(released)}`
         : `回收已完成，对象库占用 ${formatBytes(report.afterBytes)}`
-      if (!manual) notify(cleanupNotice.value)
+      if (!manual && !notice.value) notify(cleanupNotice.value)
     } else if (manual && !cleanupNotice.value) {
       cleanupNotice.value = '当前没有可执行的回收。'
     }
@@ -267,6 +328,11 @@ function cleanupNow() {
 
 function updateLibrary(updated: Library) {
   const previous = library.value
+  const result = scanResult.value?.data.library
+  if (result && (updated.directory !== result.directory || updated.currentBranch !== result.currentBranch || updated.revision !== result.revision)) {
+    scanResult.value = null
+    if (!activeScan) scanState.value = { kind: 'stale' }
+  }
   const files = new Set(updated.files)
   if (previous?.directory !== updated.directory) {
     recoveryNotice.value = ''
@@ -343,8 +409,9 @@ function chooseDirectory() {
 
 function openLibrary() {
   const directory = chosenDirectory.value
-  if (!directory) return
+  if (!directory || (createMode.value && !directoryName.value.trim())) return
   return run(async () => {
+    await stopScanBeforeNavigation()
     const result = createMode.value
       ? await invoke<LibraryTransition>('create_library', { parent: directory, name: directoryName.value.trim() })
       : await invoke<LibraryTransition>('adopt_library', { directory })
@@ -393,6 +460,7 @@ function switchBranch(name: string, token?: string) {
   if (!directory) return
   return run(async () => {
     const source = currentBranch.value
+    if (source !== name) await stopScanBeforeNavigation()
     // 确认票据过期时，保留原分支并使用 Rust 返回的新预览。
     const result = await invoke<LibraryTransition>('switch_branch', { directory, name, token })
     applyTransition(result)
@@ -434,8 +502,139 @@ function showCreateBook() {
 }
 
 function showReading(entry: 'scan' | 'import' | 'save') {
+  if (entry === 'scan') {
+    if (activeScan) {
+      closeMenu()
+      scanDetails.value = true
+    } else {
+      scanDetails.value = false
+      openPanel('scanSetup')
+    }
+    return
+  }
   readingEntry.value = entry
   openPanel('reading')
+}
+
+function scanContext(current: Library): ScanContext {
+  return { directory: current.directory, branch: current.currentBranch, revision: current.revision }
+}
+
+function matchesScan(context: ScanContext) {
+  const current = library.value
+  return current?.directory === context.directory && current.currentBranch === context.branch
+    && current.revision === context.revision
+}
+
+function startScan(formats: NovelFormat[]) {
+  if (!library.value || activeScan) return
+  const context = scanContext(library.value)
+  scanFormats.value = [...formats]
+  scanResult.value = null
+  launchScan({ kind: 'scan', scope: { ...context, formats } }, context)
+}
+
+function reviewScan(edits: ScanReviewEdit[]) {
+  const result = scanResult.value
+  if (!result || activeScan) return
+  launchScan({ kind: 'review', id: result.id, edits }, scanContext(result.data.library))
+}
+
+function launchScan(action: ScanAction, context: ScanContext) {
+  closePanel()
+  scanDetails.value = false
+  scanBranch.value = context.branch
+  scanState.value = { kind: 'starting' }
+  const stopBeforeStart = new AbortController()
+  let receiveTerminal: (event: ScanTerminal) => void = () => undefined
+  const terminal = new Promise<ScanTerminal>(resolve => { receiveTerminal = resolve })
+  const onEvent = new Channel<ScanEvent>(event => {
+    if (event.kind !== 'progress') {
+      receiveTerminal(event)
+    } else if (activeScan === job && (scanState.value?.kind !== 'stopping' || event.phase.kind === 'publishing')) {
+      scanState.value = event.phase
+    }
+  })
+  const start = Promise.resolve().then(async () => {
+    if (cleanupInFlight) {
+      const stopped = new Promise<void>(resolve => stopBeforeStart.signal.addEventListener('abort', () => resolve(), { once: true }))
+      await Promise.race([cleanupInFlight, stopped])
+    }
+    if (stopBeforeStart.signal.aborted) return null
+    if (!matchesScan(context)) throw new Error('书库已变化，请重新扫描')
+    return invoke<number>('start_novel_scan', { action, onEvent })
+  })
+  const job: ActiveScan = {
+    start, stopBeforeStart,
+    settled: start.then(async id => {
+      if (id === null) {
+        scanState.value = { kind: 'stopped' }
+        return
+      }
+      const event = await terminal
+      if (!matchesScan(context)) {
+        scanState.value = { kind: 'stale' }
+      } else if (event.kind === 'ready') {
+        scanResult.value = { id, data: event.result }
+        updateLibrary(event.result.library)
+        scanState.value = { kind: 'ready' }
+      } else {
+        scanState.value = event
+      }
+    }).catch(reason => {
+      scanState.value = { kind: 'failed', message: reason instanceof Error ? reason.message : String(reason) }
+    }).finally(() => {
+      if (activeScan === job) activeScan = null
+      queueCleanup()
+    }),
+  }
+  activeScan = job
+}
+
+async function requestScanStop(job = activeScan) {
+  if (!job || !scanCanStop.value) return
+  const previous = scanState.value
+  scanState.value = { kind: 'stopping' }
+  job.stopBeforeStart.abort()
+  const id = await job.start.catch(() => null)
+  if (id === null || activeScan !== job) return
+  try {
+    const outcome = await invoke<ScanStop>('stop_novel_scan', { id })
+    if (activeScan === job && outcome === 'publishing') scanState.value = { kind: 'publishing' }
+  } catch (reason) {
+    if (activeScan === job && scanState.value?.kind === 'stopping') {
+      scanState.value = previous
+      notify(reason instanceof Error ? reason.message : String(reason))
+    }
+  }
+}
+
+async function stopScanBeforeNavigation() {
+  const job = activeScan
+  await requestScanStop(job)
+  await job?.settled
+  scanDetails.value = false
+}
+
+function openScanDetails() {
+  if (scanState.value?.kind === 'ready' && scanResult.value) {
+    scanDetails.value = false
+    openPanel('scanResults')
+    return
+  }
+  const wasOpen = scanDetails.value
+  closeMenu()
+  scanDetails.value = !wasOpen
+}
+
+function closeScanDetails() {
+  scanDetails.value = false
+  scanTrigger.value?.focus()
+}
+
+function saveScanExternal() {
+  closePanel()
+  showReading('save')
 }
 
 function completeReading(message: string) {
@@ -473,6 +672,9 @@ function destinationError(path: string) {
     return '请输入有效的相对路径'
   }
   if (fileSuffix(path) !== fileSuffix(value)) return '请保留原文件后缀'
+  const status = movePending.value?.status
+  const conflict = status?.kind === 'preview' ? status.items.find(item => item.path === path)?.conflict : null
+  if (conflict?.normalize().toLowerCase() === value.normalize().toLowerCase()) return '新路径与目标文件仍有冲突'
   return ''
 }
 
@@ -481,6 +683,17 @@ function suggestDestination(path: string) {
   const suffix = fileSuffix(name)
   const split = suffix ? name.length - suffix.length - 1 : name.length
   newDestinations.value[path] = path.slice(0, path.length - name.length) + name.slice(0, split) + '（移入）' + name.slice(split)
+}
+
+const unfilledConflicts = computed(() => {
+  const status = movePending.value?.status
+  return status?.kind === 'preview'
+    ? status.items.filter(item => item.conflict && !newDestinations.value[item.path]?.trim())
+    : []
+})
+
+function suggestDestinations() {
+  for (const item of unfilledConflicts.value) suggestDestination(item.path)
 }
 
 const canConfirmMove = computed(() => {
@@ -570,6 +783,12 @@ function restoreSelectedVersion() {
   }, '正在恢复旧版…')
 }
 
+function chooseHistoryFile(event: Event) {
+  if (history.value && event.target instanceof HTMLSelectElement) {
+    void showHistory(event.target.value, history.value.book)
+  }
+}
+
 function openPath(relative?: string, reveal = false) {
   const current = library.value
   if (!current) return
@@ -588,11 +807,13 @@ function absolutePath(relative = '') {
 async function copyPath(relative?: string) {
   const path = absolutePath(relative)
   if (!path) return
-  closeMenu()
-  await run(async () => {
+  closeMenu(true)
+  try {
     await navigator.clipboard.writeText(path)
     notify('已复制路径。')
-  })
+  } catch (reason) {
+    error.value = reason instanceof Error ? reason.message : String(reason)
+  }
 }
 
 function showMenu(menu: NonNullable<typeof activeMenu.value>, event: MouseEvent) {
@@ -640,7 +861,8 @@ function returnFocus() {
 function onShortcut(event: KeyboardEvent) {
   if (panel.value || event.defaultPrevented) return
   if (event.key === 'Escape') {
-    if (activeMenu.value) closeMenu(true)
+    if (scanDetails.value) closeScanDetails()
+    else if (activeMenu.value) closeMenu(true)
     else if (query.value) query.value = ''
     else if (window.matchMedia('(max-width: 760px)').matches && inspector.value === 'shown') inspector.value = 'hidden'
     return
@@ -778,6 +1000,8 @@ onBeforeUnmount(() => {
                 </p>
               </div>
               <div class="heading-actions">
+                <button v-if="browser?.hasSelectableRows" type="button" class="button" :disabled="!canEdit"
+                  title="全选当前列表中的文件" @click="browser?.toggleAll()">{{ browser.allSelected ? '取消全选' : '全选' }}</button>
                 <template v-if="activeModule === 'books'">
                   <button type="button" class="button scan-action" :disabled="!canEdit" @click="showReading('scan')">
                     <DesktopIcon name="scan" />扫描小说
@@ -811,7 +1035,7 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <LibraryBrowser ref="browser" :library="library" :module="activeModule" :folder="folder"
-              :query="query" :selection="selection" @select="selection = $event" @enter-folder="navigateFolder"
+              :query="query" :selection="selection" :editable="canEdit" @select="selection = $event" @enter-folder="navigateFolder"
               @open-file="openPath" @read="showReading(activeModule === 'books' ? 'scan' : 'import')" />
           </template>
           <div v-else class="empty-state start-state">
@@ -828,9 +1052,9 @@ onBeforeUnmount(() => {
           </header>
           <div class="inspector-hero">
             <span v-if="pickedBook" class="book-glyph"><DesktopIcon name="book" /></span>
-            <span v-else-if="singleFile" class="file-glyph">{{ fileSuffix(singleFile).toUpperCase().slice(0, 8) }}</span>
+            <span v-else-if="singleFile" class="file-glyph" aria-hidden="true">{{ fileSuffix(singleFile).toUpperCase().slice(0, 8) }}</span>
             <DesktopIcon v-else :name="selectedFiles.length > 1 ? 'file' : 'folder'" />
-            <h2>{{ pickedBook?.title ?? (pickedPath ? fileName(pickedPath) : selectedFiles.length > 1 ? `${selectedFiles.length} 个文件` : fileName(folder) || libraryName) }}</h2>
+            <h2>{{ pickedBook?.title ?? (pickedPath ? fileName(pickedPath) : selectedFiles.length > 1 ? `${selectedFiles.length} 个文件` : fileName(viewFolder) || libraryName) }}</h2>
             <p>{{ pickedBook?.author || (pickedBook ? `${pickedBook.files.length} 个文件` : singleFile ? (fileSuffix(singleFile).toUpperCase() || '文件') : selectedFiles.length > 1 ? '' : '文件夹') }}</p>
           </div>
           <dl class="inspector-meta">
@@ -838,8 +1062,11 @@ onBeforeUnmount(() => {
             <template v-if="singleFile && library.novels[singleFile]?.progress">
               <dt>进度</dt><dd>{{ library.novels[singleFile]?.progress }}</dd>
             </template>
+            <template v-if="selectedFileDetails">
+              <dt>大小</dt><dd>{{ formatBytes(selectedFileDetails.bytes) }}</dd>
+            </template>
             <template v-if="pickedPath || !selection">
-              <dt>路径</dt><dd :title="absolutePath(pickedPath ?? folder)">{{ absolutePath(pickedPath ?? folder) }}</dd>
+              <dt>路径</dt><dd :title="absolutePath(pickedPath ?? viewFolder)">{{ absolutePath(pickedPath ?? viewFolder) }}</dd>
             </template>
           </dl>
           <div v-if="pickedBook" class="inspector-files">
@@ -853,14 +1080,16 @@ onBeforeUnmount(() => {
             <button v-if="singleFile" class="button" type="button" :disabled="!canEdit" @click="openPath(singleFile)"><DesktopIcon name="external" />打开文件</button>
             <button v-if="selectedFolder !== undefined" class="button" type="button" :disabled="!canEdit"
               @click="navigateFolder(selectedFolder)"><DesktopIcon name="folder" />打开文件夹</button>
-            <button v-if="singleFile || pickedBook?.files[0]" class="button" type="button" :disabled="!canEdit"
-              @click="showHistory(singleFile ?? pickedBook!.files[0])"><DesktopIcon name="history" />查看版本</button>
+            <button v-if="singleFile" class="button" type="button" :disabled="!canEdit"
+              @click="showHistory(singleFile)"><DesktopIcon name="history" />查看版本</button>
+            <button v-else-if="pickedBook?.files[0]" class="button" type="button" :disabled="!canEdit"
+              @click="showHistory(pickedBook.files[0], pickedBook)"><DesktopIcon name="history" />查看版本</button>
             <button v-if="canMove" class="button" type="button" :disabled="!canEdit" @click="showMove"><DesktopIcon name="move" />移至分支</button>
             <button v-if="canGroup" class="button" type="button" :disabled="!canEdit" @click="showCreateBook"><DesktopIcon name="plus" />创建书目</button>
             <button v-if="pickedPath || !selection" class="button" type="button" :disabled="!canEdit"
-              @click="openPath(pickedPath ?? (folder || undefined), !!pickedPath)"><DesktopIcon name="open" />{{ revealLabel }}</button>
+              @click="openPath(pickedPath ?? (viewFolder || undefined), !!pickedPath)"><DesktopIcon name="open" />{{ revealLabel }}</button>
             <button v-if="pickedPath || !selection" class="button" type="button" :disabled="!canEdit"
-              @click="copyPath(pickedPath ?? folder)"><DesktopIcon name="copy" />复制路径</button>
+              @click="copyPath(pickedPath ?? viewFolder)"><DesktopIcon name="copy" />复制路径</button>
           </div>
         </aside>
       </div>
@@ -868,17 +1097,41 @@ onBeforeUnmount(() => {
       <footer class="status-bar">
         <nav v-if="library" class="breadcrumbs" aria-label="目录路径" :title="absolutePath(activeModule === 'files' ? folder : '')">
           <DesktopIcon name="folder" />
-          <button type="button" class="truncate" @click="navigateFolder('')">{{ libraryName }}</button>
+          <button v-if="activeModule === 'files'" type="button" class="truncate" @click="navigateFolder('')">{{ libraryName }}</button>
+          <span v-else class="truncate">{{ libraryName }}</span>
           <template v-if="activeModule === 'files'">
             <template v-for="crumb in crumbs" :key="crumb.path">
               <DesktopIcon name="right" /><button type="button" class="truncate" @click="navigateFolder(crumb.path)">{{ crumb.name }}</button>
             </template>
           </template>
         </nav>
+        <div v-if="scanState" class="scan-status">
+          <button ref="scanTrigger" type="button" class="scan-status-button" :aria-expanded="scanDetails"
+            :aria-label="scanState.kind === 'ready' ? '查看扫描结果' : '扫描任务详情'"
+            :title="scanBranch + ' · ' + scanStatus" @click.stop="openScanDetails">
+            <span v-if="scanRunning" class="spinner" aria-hidden="true"></span>
+            <span class="truncate"><template v-if="scanRunning">{{ scanBranch }} · </template>{{ scanStatus }}</span>
+          </button>
+          <button v-if="scanCanStop" class="text-button scan-stop" type="button" @click="requestScanStop()">停止扫描</button>
+          <section v-if="scanDetails" class="scan-status-details" aria-label="扫描任务">
+            <strong>{{ scanBranch }}</strong>
+            <p role="status">{{ scanStatus }}</p>
+            <progress v-if="scanState.kind === 'identifying' && scanState.total > 0"
+              :value="scanState.processed" :max="scanState.total" aria-label="识别进度"></progress>
+            <p v-if="scanState.kind === 'failed'" class="inline-error" role="alert">{{ scanState.message }}</p>
+            <div class="scan-status-actions">
+              <button class="button" type="button" @click="closeScanDetails">收起</button>
+              <button v-if="scanCanStop" class="button" type="button" @click="requestScanStop()">停止扫描</button>
+              <button v-if="!scanRunning && scanResult" class="button" type="button"
+                @click="scanDetails = false; openPanel('scanResults')">查看结果</button>
+              <button v-if="!scanRunning" class="button" type="button" @click="showReading('scan')">重新扫描</button>
+            </div>
+          </section>
+        </div>
         <span v-if="task || collecting" role="status" class="task-state">
           <span class="spinner" aria-hidden="true"></span>{{ task || '正在回收空间…' }}
         </span>
-        <span v-else-if="library" class="status-count">
+        <span v-else-if="library && !scanState" class="status-count">
           {{ activeModule === 'files' ? `${visibleFileCount} 个文件` : `${bookCount} 个书目` }}
           <template v-if="selectedCount"> · 已选 {{ selectedCount }} 项</template>
           · {{ currentBranch }}
@@ -888,7 +1141,7 @@ onBeforeUnmount(() => {
 
     <div v-if="notice && !panel" class="toast" role="status"><DesktopIcon name="check" />{{ notice }}</div>
 
-    <DesktopSheet v-if="panel" :title="title" :busy="busy" :wide="panel === 'reading' || panel === 'diagnostics'"
+    <DesktopSheet v-if="panel" :title="title" :busy="busy" :wide="panel === 'reading' || panel === 'diagnostics' || panel === 'scanResults'"
       @close="closePanel" @return-focus="returnFocus">
       <LibraryReading v-if="panel === 'reading' && library" :library="library" :busy="busy"
         :run="runReading" :module="activeModule" :entry="readingEntry"
@@ -896,6 +1149,10 @@ onBeforeUnmount(() => {
         <p v-if="error" class="inline-error" role="alert">{{ error }}</p>
         <p v-if="busy" class="sheet-task" role="status">{{ task }}</p>
       </LibraryReading>
+
+      <LibraryScan v-else-if="panel === 'scanSetup' || panel === 'scanResults'"
+        :branch="currentBranch" :formats="scanFormats" :result="panel === 'scanResults' ? scanResult?.data ?? null : null"
+        @start="startScan" @review="reviewScan" @save-external="saveScanExternal" @close="closePanel" />
 
       <template v-else>
         <div class="sheet-body">
@@ -908,18 +1165,18 @@ onBeforeUnmount(() => {
             <label class="check-field"><input v-model="createMode" type="checkbox" :disabled="busy" />在所选目录下新建独立管理目录</label>
             <label v-if="createMode" class="field">
               <span>目录名称</span>
-              <input v-model="directoryName" type="text" :disabled="busy" @keydown.enter="openLibrary" />
+              <input v-model="directoryName" type="text" :disabled="busy" @keydown.enter="!$event.isComposing && openLibrary()" />
             </label>
           </template>
 
           <label v-else-if="panel === 'branch'" class="field">
             <span>分支名称</span>
-            <input v-model="branchName" type="text" data-initial-focus :disabled="busy" @keydown.enter="createBranch" />
+            <input v-model="branchName" type="text" data-initial-focus :disabled="busy" @keydown.enter="!$event.isComposing && createBranch()" />
           </label>
 
           <label v-else-if="panel === 'book'" class="field">
             <span>书目名称</span>
-            <input v-model="bookTitle" type="text" data-initial-focus :disabled="busy" @keydown.enter="createBook" />
+            <input v-model="bookTitle" type="text" data-initial-focus :disabled="busy" @keydown.enter="!$event.isComposing && createBook()" />
           </label>
 
           <template v-else-if="panel === 'switch' && pending">
@@ -955,6 +1212,9 @@ onBeforeUnmount(() => {
             </template>
             <template v-else-if="movePending?.status.kind === 'preview'">
               <p>移动 {{ movePending.status.items.length }} 项。确认后两个分支会一起更新。</p>
+              <button v-if="unfilledConflicts.length > 1" class="button" type="button" :disabled="busy" @click="suggestDestinations">
+                批量填入建议名称
+              </button>
               <ul class="sheet-list move-items">
                 <li v-for="item in movePending.status.items" :key="item.path">
                   <div class="move-file"><DesktopIcon name="file" /><span class="break-text">{{ item.path }}</span></div>
@@ -988,6 +1248,7 @@ onBeforeUnmount(() => {
               <p>将所选旧版恢复至「{{ currentBranch }}」，并保存为新的当前版。</p>
               <dl class="restore-preview">
                 <dt>所选旧版</dt><dd>{{ restoreChoice.savedPath }}</dd>
+                <dt>待替换文件</dt><dd>{{ history.path }}</dd>
                 <dt>恢复位置</dt><dd>{{ restoreChoice.destination }}</dd>
               </dl>
             </template>
@@ -998,6 +1259,12 @@ onBeforeUnmount(() => {
                   :aria-pressed="tab.path === history.path" :disabled="busy"
                   @click="tab.path !== history.path && showHistory(tab.path, history.book)">{{ tab.label }}</button>
               </div>
+              <label v-if="historyPeers.length > 1" class="field">
+                <span>恢复时替换的当前文件</span>
+                <select :value="history.path" :disabled="busy" @change="chooseHistoryFile">
+                  <option v-for="path in historyPeers" :key="path">{{ path }}</option>
+                </select>
+              </label>
               <section class="history-group" aria-labelledby="current-versions">
                 <h3 id="current-versions">各分支当前版</h3>
                 <ul class="sheet-list history-list">

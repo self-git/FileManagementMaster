@@ -364,9 +364,17 @@ impl WorktreePlan {
         ))
     }
 
-    fn apply_files(&self, repo: &Repository<'_>, stage: &Path) -> Result<()> {
+    fn apply_files(
+        &self,
+        repo: &Repository<'_>,
+        stage: &Path,
+        check: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<()> {
         for (index, change) in self.changes.iter().enumerate() {
-            Self::stage_original(repo, stage, index, change)?;
+            if let Some(check) = check {
+                check()?;
+            }
+            Self::stage_original(repo, stage, index, change, check)?;
         }
         for change in &self.changes {
             if change.old.is_some() {
@@ -387,18 +395,19 @@ impl WorktreePlan {
         stage: &Path,
         index: usize,
         change: &FileChange,
+        check: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<()> {
         if let Some(old) = &change.old {
             let path = resolved_path(repo.root(), &change.path, false)?;
             ensure!(
-                observe(repo, &path)?.as_ref() == Some(old),
+                observe_checked(repo, &path, check)?.as_ref() == Some(old),
                 "文件已变更，请重新确认 {}",
                 path.display()
             );
             let backup = staged_path(stage, "old", index);
             rename_exclusive(&path, &backup)?;
             ensure!(
-                observe(repo, &backup)?.as_ref() == Some(old),
+                observe_checked(repo, &backup, check)?.as_ref() == Some(old),
                 "暂存期间文件已变更 {}",
                 path.display()
             );
@@ -501,14 +510,38 @@ pub(crate) fn apply_operation(
     plan: WorktreePlan,
     stage: Option<TempDir>,
 ) -> Result<()> {
+    apply_operation_checked(repo, lease, references, plan, stage, None)
+}
+
+pub(crate) struct OperationChecks<'a> {
+    pub(crate) checkpoint: &'a dyn Fn() -> Result<()>,
+    pub(crate) before_publish: &'a dyn Fn() -> Result<()>,
+}
+
+pub(crate) fn apply_operation_checked(
+    repo: &Repository<'_>,
+    lease: &WriteLease,
+    references: Vec<RefEdit>,
+    plan: WorktreePlan,
+    stage: Option<TempDir>,
+    checks: Option<OperationChecks<'_>>,
+) -> Result<()> {
+    let checkpoint = checks.as_ref().map(|checks| checks.checkpoint);
+    if let Some(check) = checkpoint {
+        check()?;
+    }
     let (mut git, record) = begin_operation(repo, lease, references, plan)?;
     let staged_dir = stage.map(TempDir::keep);
     let plan = record.plan.as_ref().context("缺少工作目录操作")?;
     let outcome = (|| -> Result<()> {
         if let Some(staged_dir) = &staged_dir {
-            plan.apply_files(repo, staged_dir)?;
+            plan.apply_files(repo, staged_dir, checkpoint)?;
+            let files = match checkpoint {
+                Some(check) => scan_checked(repo, check)?,
+                None => scan(repo)?,
+            };
             ensure!(
-                scan(repo)? == snapshot_files(repo, &plan.new_index)?,
+                files == snapshot_files(repo, &plan.new_index)?,
                 "操作期间目录出现外部改动"
             );
         }
@@ -518,6 +551,12 @@ pub(crate) fn apply_operation(
                 repo.reference(&head.previous)? == plan.old_index,
                 "切换前原分支快照已变化"
             );
+        }
+        // 引用准备会取得 reftable 锁，从此处开始由 Git 完整结束事务。
+        if let Some(checks) = &checks {
+            (checks.before_publish)()?;
+        }
+        if let Some(head) = &plan.head {
             git.prepare_switch(
                 &head.previous,
                 &head.next,
@@ -652,8 +691,30 @@ pub(crate) fn scan_source(
     accepts: impl Fn(&str) -> bool,
 ) -> Result<Files> {
     let mut files = Files::new();
-    scan_dir(repo, root, root, &accepts, &mut files)?;
+    visit_files(root, &accepts, &|| Ok(()), &mut |relative, path, info| {
+        files.insert(relative, BlobFile {
+            oid: repo.file_oid(&path, false)?,
+            executable: executable(&info),
+        });
+        Ok(())
+    })?;
     Ok(files)
+}
+
+pub(crate) fn scan_checked(
+    repo: &Repository<'_>,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<Files> {
+    let mut paths = Vec::new();
+    visit_files(repo.root(), &|_| true, checkpoint, &mut |relative, _, info| {
+        paths.push((relative, executable(&info)));
+        Ok(())
+    })?;
+    let names: Vec<_> = paths.iter().map(|(path, _)| path.as_str()).collect();
+    let oids = repo.file_oids(&names, checkpoint)?;
+    Ok(paths.into_iter().zip(oids).map(|((path, executable), oid)| {
+        (path, BlobFile { oid, executable })
+    }).collect())
 }
 
 pub(crate) fn snapshot_files(repo: &Repository<'_>, commit: &str) -> Result<Files> {
@@ -678,16 +739,27 @@ pub(crate) fn snapshot_files(repo: &Repository<'_>, commit: &str) -> Result<File
         .collect()
 }
 
+pub(crate) fn visit_files(
+    root: &Path,
+    accepts: &dyn Fn(&str) -> bool,
+    checkpoint: &dyn Fn() -> Result<()>,
+    visit: &mut dyn FnMut(String, PathBuf, fs::Metadata) -> Result<()>,
+) -> Result<()> {
+    scan_dir(root, root, accepts, checkpoint, visit)
+}
+
 fn scan_dir(
-    repo: &Repository<'_>,
     root: &Path,
     directory: &Path,
-    accepts: &impl Fn(&str) -> bool,
-    files: &mut Files,
+    accepts: &dyn Fn(&str) -> bool,
+    checkpoint: &dyn Fn() -> Result<()>,
+    visit: &mut dyn FnMut(String, PathBuf, fs::Metadata) -> Result<()>,
 ) -> Result<()> {
+    checkpoint()?;
     for entry in
         fs::read_dir(directory).with_context(|| format!("读取目录 {}", directory.display()))?
     {
+        checkpoint()?;
         let entry = entry?;
         let name = entry.file_name();
         if name.eq_ignore_ascii_case(".git")
@@ -705,26 +777,22 @@ fn scan_dir(
         }
         if info.is_dir() {
             if metadata(&path.join(".git"))?.is_none() {
-                scan_dir(repo, root, &path, accepts, files)?;
+                scan_dir(root, &path, accepts, checkpoint, visit)?;
             }
         } else if info.is_file() && accepts(name.to_str().context("文件名不是有效的 Unicode")?)
         {
-            let relative = path
-                .strip_prefix(root)?
-                .iter()
-                .map(|name| name.to_str().context("文件名不是有效的 Unicode"))
-                .collect::<Result<Vec<_>>>()?
-                .join("/");
-            files.insert(
-                relative,
-                BlobFile {
-                    oid: repo.file_oid(&path, false)?,
-                    executable: executable(&info),
-                },
-            );
+            visit(relative_path(root, &path)?, path, info)?;
         }
     }
     Ok(())
+}
+
+fn relative_path(root: &Path, path: &Path) -> Result<String> {
+    Ok(path.strip_prefix(root)?
+        .iter()
+        .map(|name| name.to_str().context("文件名不是有效的 Unicode"))
+        .collect::<Result<Vec<_>>>()?
+        .join("/"))
 }
 
 pub(crate) fn save_file(repo: &Repository<'_>, path: &str, expected: &BlobFile) -> Result<()> {
@@ -753,6 +821,14 @@ pub(crate) fn save_from(
 }
 
 fn observe(repo: &Repository<'_>, path: &Path) -> Result<Option<BlobFile>> {
+    observe_checked(repo, path, None)
+}
+
+fn observe_checked(
+    repo: &Repository<'_>,
+    path: &Path,
+    checkpoint: Option<&dyn Fn() -> Result<()>>,
+) -> Result<Option<BlobFile>> {
     let Some(info) = metadata(path)? else {
         return Ok(None);
     };
@@ -761,8 +837,13 @@ fn observe(repo: &Repository<'_>, path: &Path) -> Result<Option<BlobFile>> {
         "路径已被占用 {}",
         path.display()
     );
+    let oid = match checkpoint {
+        Some(check) => repo.file_oids(&[&relative_path(repo.root(), path)?], check)?
+            .pop().context("Git 未返回文件指纹")?,
+        None => repo.file_oid(path, false)?,
+    };
     Ok(Some(BlobFile {
-        oid: repo.file_oid(path, false)?,
+        oid,
         executable: executable(&info),
     }))
 }
@@ -837,7 +918,7 @@ pub(crate) fn is_link(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-fn executable(metadata: &fs::Metadata) -> bool {
+pub(crate) fn executable(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -918,6 +999,44 @@ mod tests {
         next.try_lock().unwrap();
         drop(duplicate);
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stopped_before_publishing_restores_staged_files() -> Result<()> {
+        let runtime = std::env::var_os("FILEMANAGEMENT_BUNDLED_GIT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/git"));
+        let folder = tempfile::tempdir()?;
+        let root = folder.path().canonicalize()?;
+        let path = root.join("旧版.txt");
+        fs::write(&path, b"keep the original")?;
+        crate::LibraryEngine::new(&runtime)?.adopt_or_open(&root)?;
+        let git = crate::git::Git::bundled(&runtime)?;
+        let repo = Repository::at(&git, root);
+        let lease = WriteLease::try_acquire(&repo)?.unwrap();
+        let reference = repo.run(&["symbolic-ref", "HEAD"])?;
+        let before = repo.reference(&reference)?.unwrap();
+        let empty = Files::new();
+        let after = repo.snapshot_modes([], "预备移入历史")?;
+        let (plan, stage) = WorktreePlan::update(&repo, &lease, (&before, &after), &snapshot_files(&repo, &before)?, &empty)?;
+        let result = apply_operation_checked(
+            &repo, &lease, vec![RefEdit::replace(&reference, &before, &after)], plan, Some(stage),
+            Some(OperationChecks {
+                checkpoint: &|| Ok(()),
+                before_publish: &|| {
+                    assert!(!path.exists());
+                    assert!(!ref_lock(&repo).exists());
+                    bail!("测试停止");
+                },
+            }),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "测试停止");
+        assert_eq!(fs::read(path)?, b"keep the original");
+        assert_eq!(repo.reference(&reference)?, Some(before));
+        assert!(!lease.record_path().exists());
+        assert!(!ref_lock(&repo).exists());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -934,17 +1053,17 @@ pub(crate) fn interrupt_move_for_test(
     let plan = record.plan.as_ref().unwrap();
     match boundary {
         "partly-staged" => {
-            WorktreePlan::stage_original(repo, &stage, 0, &plan.changes[0])?;
+            WorktreePlan::stage_original(repo, &stage, 0, &plan.changes[0], None)?;
             drop(git);
         }
         "prepared" => {
-            plan.apply_files(repo, &stage)?;
+            plan.apply_files(repo, &stage, None)?;
             git.prepare_references(&record.references)?;
             git.interrupt()?;
             ensure!(ref_lock(repo).is_file(), "Git 应留下待恢复的引用锁");
         }
         "published" => {
-            plan.apply_files(repo, &stage)?;
+            plan.apply_files(repo, &stage, None)?;
             git.prepare_references(&record.references)?;
             git.commit_prepared()?;
         }
