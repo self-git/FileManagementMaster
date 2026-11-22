@@ -243,8 +243,7 @@ impl<'a> Repository<'a> {
         message: &str,
     ) -> Result<String> {
         let scratch = tempfile::tempdir_in(self.control_dir())?;
-        // Git runs from the repository root and expects a path without Windows' verbatim prefix.
-        let index = scratch.path().strip_prefix(&self.root)?.join("index");
+        let index = scratch.path().join("index");
         require_success(
             self.exec(&["read-tree", "--empty"], None, Some(&index))?,
             "read-tree",
@@ -353,7 +352,8 @@ impl<'a> Repository<'a> {
     fn exec(&self, args: &[&str], input: Option<&[u8]>, index: Option<&Path>) -> Result<Output> {
         let mut command = self.git.command(&self.root, args);
         if let Some(index) = index {
-            command.env("GIT_INDEX_FILE", index);
+            // Git 在书库根目录运行。相对路径可避免传入 Windows 扩展路径前缀。
+            command.env("GIT_INDEX_FILE", index.strip_prefix(&self.root)?);
         }
         let Some(input) = input else {
             return command
