@@ -1,0 +1,18 @@
+{
+  "version": "2.56.1",
+  "macos": {
+    "archive": "git-2.56.1.tar.xz",
+    "url": "https://www.kernel.org/pub/software/scm/git/git-2.56.1.tar.xz",
+    "sha256": "f0b0bf89264b9bd2e1c640363e7529643989da76281600473c50745cd34a607f",
+    "executable": "bin/git",
+    "execPath": "bin"
+  },
+  "windows": {
+    "archive": "MinGit-2.56.1-64-bit.zip",
+    "url": "https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip",
+    "sha256": "4a92850b6e917da4fd010669b614b55dccf5b0ec333a534cc4be4700dfefdafd",
+    "executable": "ucrt64/bin/git.exe",
+    "execPath": "ucrt64/libexec/git-core",
+    "versionSuffix": ".windows.1"
+  }
+}

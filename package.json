@@ -1,0 +1,29 @@
+{
+  "name": "filemanagement-master",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "pack:source": "bash scripts/pack-source.sh",
+    "git:prepare": "node scripts/prepare-git.mjs",
+    "git:verify": "npm run git:prepare && cargo test --locked --manifest-path src-tauri/Cargo.toml --tests -- --nocapture",
+    "desktop:dev": "npm run git:prepare && tauri dev",
+    "desktop:build": "npm run git:prepare && tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.0",
+    "vue": "^3.5.25"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.0",
+    "@vitejs/plugin-vue": "^6.0.2",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.0",
+    "vue-tsc": "^3.2.0"
+  }
+}
